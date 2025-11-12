@@ -26,9 +26,9 @@ const register = async (req, res) => {
     // Generate verification code
     const verificationCode = generateVerificationCode();
 
+    // Create user in Firebase Auth
     let userRecord;
     try {
-      // Create user in Firebase Auth
       userRecord = await auth.createUser({
         email,
         password: hashedPassword,
@@ -37,16 +37,20 @@ const register = async (req, res) => {
       });
     } catch (firebaseError) {
       console.error('❌ Firebase Auth creation error:', firebaseError);
-      
       if (firebaseError.code === 'auth/email-already-exists') {
         return res.status(400).json({ 
           success: false,
           error: 'User already exists with this email' 
         });
       }
-      
       throw firebaseError;
     }
+
+    // All roles require verification
+    const requiresVerification = true;
+
+    // Set isVerified based on role and environment
+    const isVerified = process.env.NODE_ENV === 'development' ? true : false;
 
     // Create user document in Firestore
     const userData = {
@@ -55,8 +59,8 @@ const register = async (req, res) => {
       name,
       role,
       password: hashedPassword,
-      isVerified: false,
-      verificationCode,
+      isVerified,
+      verificationCode: requiresVerification ? verificationCode : null,
       createdAt: new Date(),
       updatedAt: new Date(),
       status: 'active',
@@ -65,7 +69,7 @@ const register = async (req, res) => {
 
     await db.collection('users').doc(userRecord.uid).set(userData);
 
-    // Create role-specific document (except for admin)
+    // Create role-specific document (except admin)
     if (role !== 'admin') {
       const roleData = {
         uid: userRecord.uid,
@@ -73,39 +77,24 @@ const register = async (req, res) => {
         name,
         createdAt: new Date(),
         updatedAt: new Date(),
-        // Immediately approve all roles
         status: 'approved',
         ...additionalData
       };
-
       const collectionName = role === 'company' ? 'companies' : `${role}s`;
       await db.collection(collectionName).doc(userRecord.uid).set(roleData);
     }
 
-    // Send verification email (don't fail if email fails)
+    // Send verification email only if not in development
     let emailSent = false;
-    try {
-      emailSent = await sendVerificationEmail(email, verificationCode);
-    } catch (emailError) {
-      console.log('⚠️ Email sending failed, but registration continues');
-      // Don't throw error - registration should succeed even if email fails
+    if (requiresVerification && process.env.NODE_ENV !== 'development') {
+      try {
+        emailSent = await sendVerificationEmail(email, verificationCode);
+      } catch (emailError) {
+        console.log('⚠️ Email sending failed, registration continues');
+      }
     }
 
-    // Generate JWT token
-    const token = jwt.sign(
-      { 
-        userId: userRecord.uid, 
-        role: role,
-        email: email
-      },
-      process.env.JWT_SECRET,
-      { expiresIn: '24h' }
-    );
-
-    console.log(`✅ User registered successfully: ${email}`);
-    console.log(`📧 Verification code: ${verificationCode}`);
-
-    // AUTO-VERIFY FOR DEVELOPMENT - Remove this in production
+    // AUTO-VERIFY FOR DEVELOPMENT
     if (process.env.NODE_ENV === 'development') {
       console.log('🔄 DEVELOPMENT: Auto-verifying email...');
       await db.collection('users').doc(userRecord.uid).update({
@@ -113,15 +102,22 @@ const register = async (req, res) => {
         verificationCode: null,
         updatedAt: new Date()
       });
-
       try {
-        await auth.updateUser(userRecord.uid, {
-          emailVerified: true
-        });
+        await auth.updateUser(userRecord.uid, { emailVerified: true });
       } catch (firebaseError) {
         console.error('⚠️ Could not update Firebase Auth email status:', firebaseError);
       }
     }
+
+    // Generate JWT token
+    const token = jwt.sign(
+      { userId: userRecord.uid, role, email },
+      process.env.JWT_SECRET,
+      { expiresIn: '24h' }
+    );
+
+    console.log(`✅ User registered successfully: ${email}`);
+    if (requiresVerification) console.log(`📧 Verification code: ${verificationCode}`);
 
     res.status(201).json({
       success: true,
@@ -134,16 +130,15 @@ const register = async (req, res) => {
         email,
         name,
         role,
-        isVerified: process.env.NODE_ENV === 'development' ? true : false
+        isVerified
       },
-      verificationCode: verificationCode,
+      verificationCode: requiresVerification ? verificationCode : null,
       emailSent
     });
 
   } catch (error) {
     console.error('❌ Registration error:', error);
-    
-    // Provide more specific error messages
+
     let errorMessage = 'Internal server error during registration';
     let statusCode = 500;
 
@@ -170,39 +165,26 @@ const register = async (req, res) => {
 const login = async (req, res) => {
   try {
     const { email, password } = req.body;
-
     console.log(`🔐 Login attempt: ${email}`);
 
-    // Input validation
     if (!email || !password) {
-      return res.status(400).json({ 
-        success: false,
-        error: 'Email and password are required' 
-      });
+      return res.status(400).json({ success: false, error: 'Email and password are required' });
     }
 
-    // Find user
     const usersSnapshot = await db.collection('users').where('email', '==', email).get();
     if (usersSnapshot.empty) {
-      return res.status(400).json({ 
-        success: false,
-        error: 'Invalid email or password' 
-      });
+      return res.status(400).json({ success: false, error: 'Invalid email or password' });
     }
 
     const userDoc = usersSnapshot.docs[0];
     const user = userDoc.data();
 
-    // Verify password
     const validPassword = await bcrypt.compare(password, user.password);
     if (!validPassword) {
-      return res.status(400).json({ 
-        success: false,
-        error: 'Invalid email or password' 
-      });
+      return res.status(400).json({ success: false, error: 'Invalid email or password' });
     }
 
-    // Check if email is verified - SKIP IN DEVELOPMENT
+    // Check email verification
     if (!user.isVerified && process.env.NODE_ENV !== 'development') {
       return res.status(400).json({ 
         success: false,
@@ -212,9 +194,8 @@ const login = async (req, res) => {
       });
     }
 
-    // For development, auto-verify if not verified
+    // Auto-verify in development
     if (!user.isVerified && process.env.NODE_ENV === 'development') {
-      console.log('🔄 DEVELOPMENT: Auto-verifying user for login...');
       await db.collection('users').doc(userDoc.id).update({
         isVerified: true,
         verificationCode: null,
@@ -223,57 +204,27 @@ const login = async (req, res) => {
       user.isVerified = true;
     }
 
-    // Ensure account is active based on role document (auto-heal user status)
+    // Ensure account is active
     if (user.status !== 'active') {
       const collectionName = user.role === 'company' ? 'companies' : (user.role === 'institution' ? 'institutions' : null);
       if (collectionName) {
         const roleDoc = await db.collection(collectionName).doc(userDoc.id).get();
         const roleData = roleDoc.exists ? roleDoc.data() : {};
-        // Block only suspended accounts; otherwise activate
         if (roleData.status === 'suspended') {
-          return res.status(400).json({ 
-            success: false,
-            error: 'Account is not active. Please contact support.' 
-          });
+          return res.status(400).json({ success: false, error: 'Account is not active. Please contact support.' });
         }
         await db.collection('users').doc(userDoc.id).update({ status: 'active', updatedAt: new Date() });
         user.status = 'active';
       }
     }
 
-    // Generate JWT token
-    const token = jwt.sign(
-      { 
-        userId: userDoc.id, 
-        role: user.role,
-        email: user.email
-      },
-      process.env.JWT_SECRET,
-      { expiresIn: '24h' }
-    );
+    const token = jwt.sign({ userId: userDoc.id, role: user.role, email: user.email }, process.env.JWT_SECRET, { expiresIn: '24h' });
 
-    console.log(`✅ User logged in successfully: ${email}`);
-
-    res.json({
-      success: true,
-      message: 'Login successful',
-      token,
-      user: {
-        id: userDoc.id,
-        email: user.email,
-        name: user.name,
-        role: user.role,
-        isVerified: user.isVerified
-      }
-    });
+    res.json({ success: true, message: 'Login successful', token, user: { id: userDoc.id, email: user.email, name: user.name, role: user.role, isVerified: user.isVerified } });
 
   } catch (error) {
     console.error('❌ Login error:', error);
-    res.status(500).json({ 
-      success: false,
-      error: 'Internal server error during login',
-      details: process.env.NODE_ENV === 'development' ? error.message : undefined
-    });
+    res.status(500).json({ success: false, error: 'Internal server error during login', details: process.env.NODE_ENV === 'development' ? error.message : undefined });
   }
 };
 
@@ -281,65 +232,37 @@ const login = async (req, res) => {
 const verifyEmail = async (req, res) => {
   try {
     const { email, verificationCode } = req.body;
-
     console.log(`📧 Email verification attempt: ${email}`);
 
     if (!email || !verificationCode) {
-      return res.status(400).json({ 
-        success: false,
-        error: 'Email and verification code are required' 
-      });
+      return res.status(400).json({ success: false, error: 'Email and verification code are required' });
     }
 
     const usersSnapshot = await db.collection('users').where('email', '==', email).get();
     if (usersSnapshot.empty) {
-      return res.status(400).json({ 
-        success: false,
-        error: 'User not found' 
-      });
+      return res.status(400).json({ success: false, error: 'User not found' });
     }
 
     const userDoc = usersSnapshot.docs[0];
     const user = userDoc.data();
 
     if (user.verificationCode !== verificationCode) {
-      return res.status(400).json({ 
-        success: false,
-        error: 'Invalid verification code' 
-      });
+      return res.status(400).json({ success: false, error: 'Invalid verification code' });
     }
 
-    // Update user as verified
-    await db.collection('users').doc(userDoc.id).update({
-      isVerified: true,
-      verificationCode: null,
-      updatedAt: new Date()
-    });
+    await db.collection('users').doc(userDoc.id).update({ isVerified: true, verificationCode: null, updatedAt: new Date() });
 
-    // Update Firebase Auth email verification status
     try {
-      await auth.updateUser(user.uid, {
-        emailVerified: true
-      });
+      await auth.updateUser(user.uid, { emailVerified: true });
     } catch (firebaseError) {
       console.error('⚠️ Could not update Firebase Auth email status:', firebaseError);
-      // Continue anyway - we've updated Firestore
     }
 
-    console.log(`✅ Email verified successfully: ${email}`);
-
-    res.json({ 
-      success: true,
-      message: 'Email verified successfully' 
-    });
+    res.json({ success: true, message: 'Email verified successfully' });
 
   } catch (error) {
     console.error('❌ Email verification error:', error);
-    res.status(500).json({ 
-      success: false,
-      error: 'Internal server error during email verification',
-      details: process.env.NODE_ENV === 'development' ? error.message : undefined
-    });
+    res.status(500).json({ success: false, error: 'Internal server error during email verification', details: process.env.NODE_ENV === 'development' ? error.message : undefined });
   }
 };
 
@@ -347,87 +270,41 @@ const verifyEmail = async (req, res) => {
 const getProfile = async (req, res) => {
   try {
     const userId = req.user.id;
-    
     const userDoc = await db.collection('users').doc(userId).get();
-    if (!userDoc.exists) {
-      return res.status(404).json({ 
-        success: false,
-        error: 'User not found' 
-      });
-    }
+    if (!userDoc.exists) return res.status(404).json({ success: false, error: 'User not found' });
 
-    const user = userDoc.data();
-    
-    // Remove sensitive data
-    const { password, verificationCode, ...userProfile } = user;
-
-    res.json({
-      success: true,
-      user: userProfile
-    });
-
+    const { password, verificationCode, ...userProfile } = userDoc.data();
+    res.json({ success: true, user: userProfile });
   } catch (error) {
     console.error('❌ Get profile error:', error);
-    res.status(500).json({ 
-      success: false,
-      error: 'Internal server error',
-      details: process.env.NODE_ENV === 'development' ? error.message : undefined
-    });
+    res.status(500).json({ success: false, error: 'Internal server error', details: process.env.NODE_ENV === 'development' ? error.message : undefined });
   }
 };
 
-// Development endpoint to bypass email verification
+// Development bypass for verification
 const devVerify = async (req, res) => {
   try {
     const { email } = req.body;
-
     const usersSnapshot = await db.collection('users').where('email', '==', email).get();
-    if (usersSnapshot.empty) {
-      return res.status(400).json({ 
-        success: false,
-        error: 'User not found' 
-      });
-    }
+    if (usersSnapshot.empty) return res.status(400).json({ success: false, error: 'User not found' });
 
     const userDoc = usersSnapshot.docs[0];
     const user = userDoc.data();
 
-    await db.collection('users').doc(userDoc.id).update({
-      isVerified: true,
-      verificationCode: null,
-      updatedAt: new Date()
-    });
+    await db.collection('users').doc(userDoc.id).update({ isVerified: true, verificationCode: null, updatedAt: new Date() });
 
-    // Update Firebase Auth if possible
     try {
-      await auth.updateUser(user.uid, {
-        emailVerified: true
-      });
+      await auth.updateUser(user.uid, { emailVerified: true });
     } catch (firebaseError) {
       console.error('⚠️ Could not update Firebase Auth:', firebaseError);
     }
 
-    console.log(`✅ Development verification for: ${email}`);
-
-    res.json({ 
-      success: true,
-      message: 'Account verified in development mode' 
-    });
+    res.json({ success: true, message: 'Account verified in development mode' });
 
   } catch (error) {
     console.error('❌ Dev verify error:', error);
-    res.status(500).json({ 
-      success: false,
-      error: 'Internal server error',
-      details: error.message 
-    });
+    res.status(500).json({ success: false, error: 'Internal server error', details: error.message });
   }
 };
 
-module.exports = { 
-  register, 
-  login, 
-  verifyEmail, 
-  getProfile,
-  devVerify 
-};
+module.exports = { register, login, verifyEmail, getProfile, devVerify };
